@@ -1,0 +1,142 @@
+theory PALM_In_Memory_Private_IO
+begin
+
+builtins: hashing, signing
+
+functions: runOp/2
+
+/* ============================================================
+   KEY and TDX SETUP (Steps 1-3)
+   ============================================================ */
+
+rule Init_TDX_TD:
+  [ 
+      Fr(~k),   // This is the TDX internal mac key
+      Fr(~qsk), // this is the quoting enclave secret key
+      In(tdImage) // this is the tdImage received as input
+      //Fr(~S) // Software containing PAL*M measureer script
+  ] 
+  --[
+      InitTD(tdImage),     /// log that we have initialized a td with the tdImage
+      SecretKey(~k),       /// log that we have two secret keys
+      SecretKey(~qsk),
+      //InitialInstall(~S, tdImage) // install software S into tdImage`
+      InitialInstall(tdImage) // install software S into tdImage`
+  ]->
+  [
+      !Key(~k),    /// persistant facts about the three keys: k, (qsk, qpk)
+      !QESignKey(~qsk),
+      !QEVerKey(pk(~qsk)),
+      Out(pk(~qsk)), /// public key is known to adv, so output
+      !TDIsRunning(tdImage) /// fact that is used to "launch the td" in a sense, 
+                              /// in TDX, launch also means CPU extends hash
+      //PrvMemory(~S) /// the Prv TD memory has installed S
+  ]
+
+/* Step 4 */
+/// now get the op inputs [op, chaal, I]
+rule Get_Operation_Inputs:
+  [ In(op), Fr(~I), In(chal), !TDIsRunning(hTD)]  // I is now a fresh private input, already installed by prv
+  --[InputMessage(op, ~I, chal)]->
+  [ OperationInputs(op, ~I, chal, hTD)] 
+
+/* setp 5 */
+//// execute to produce O
+rule Execute_Operation:
+  let
+  O = runOp(op, I)
+  in
+  [OperationInputs(op, I, chal, hTD)]
+  --[RunOperation(op, I, chal, O), SecretOutput(O)]-> /// log output as secret
+  [CompleteOperation(op, I, chal, O, hTD)]
+
+
+/* Step 6 and 7*/
+rule TD_Produce_Report:
+    let
+    O = runOp(op, I)
+    mac = h(<h(I), h(op), h(chal), h(O), hTD, k>)
+    in
+    [ !Key(k), CompleteOperation(op, I, chal, runOp(op, I), hTD)
+    ]
+  --[ TDProducesReport(op, I, chal, runOp(op, I), hTD, k) ]->
+    [ 
+      Out(<h(I), h(op), h(chal), h(O), hTD, mac>), /// from operation, output only hashes of I and O
+      ReportReady(op, I, chal, runOp(op, I), hTD, k)
+    ]
+
+/* Step 9 */
+///// Should only produce quote if receives as input a report and MAC that was produced over the report with k
+rule QE_Produce_Quote:
+    let 
+      mac = h(<hI, hOp, hChal, hO, hTD, k>)
+      hashes = <hI, hOp, hChal, hO, hTD>
+      sig = sign(hashes, qsk)
+    in
+    [ 
+      !QESignKey(qsk),
+      In(<hI, hOp, hChal, hO, hTD, mac>),
+      ReportReady(op, I, chal, O, hTD, k)
+    ]
+  --[
+      MacCheck(hI, hOp, hChal, hO, hTD, mac, k),
+      QEQuotes(hI, hOp, hChal, hO, hTD, pk(qsk))
+    ]->
+    [Out(<hashes, sig>), SignatureReady(op, I, chal, O, hTD, sig)]
+
+/* Step 10 */
+rule Vrf_Verifies:
+    let 
+      hashes = <hI, hOp, hChal, hO, hTD>
+    in
+    [ 
+      !QEVerKey(pkQ),
+      SignatureReady(op, I, chal, O, hTD, sig),
+      In(<hashes, sig>)
+    ]
+  --[ VrfAccepts(op, I, chal, O, hTD, verify(sig, <h(I), h(op), h(chal), h(O), hTD>, pkQ), pkQ) ]->
+    [] 
+
+
+/* ============================================================
+   LEMMAS
+   ============================================================ */
+
+lemma prv_can_attest:
+  exists-trace
+  "Ex op I chal O k hTD vk #j #m #n.
+    TDProducesReport(op, I, chal, O, hTD, k) @ #j
+    & QEQuotes(h(I), h(op), h(chal), h(O), hTD, vk) @ #m
+    & VrfAccepts(op, I, chal, O, hTD, true, vk) @ #n
+    & #j < #m & #m < #n"
+
+lemma key_secrecy [reuse]:
+  "All k #i. SecretKey(k) @ #i ==> not (Ex #j. K(k) @ #j)"
+
+lemma private_O [reuse]:
+  "All X #i. SecretOutput(X) @ #i ==> not (Ex #j. K(X) @ #j)" 
+
+lemma quote_integrity [reuse]:
+  "All op I chal O hTD vk #n.
+     VrfAccepts(op, I, chal, O, hTD, true, vk) @ #n
+   ==> Ex #m. QEQuotes(h(I), h(op), h(chal), h(O), hTD, vk) @ #m & #m < #n"
+
+lemma quote_only_if_mac:
+  "All hI hOp hChal hO hTD mac k #i.
+      MacCheck(hI, hOp, hChal, hO, hTD, mac, k) @ #i
+    ==> mac = h(<hI, hOp, hChal, hO, hTD, k>)"
+
+lemma O_came_from_op_and_I:
+  "All op I chal O hTD pkQ #i.
+     VrfAccepts(op, I, chal, O, hTD, true, pkQ) @ #i
+     ==> O = runOp(op, I)"
+
+lemma td_measurement_integrity:
+  "All op I chal O tdImage vk #n.
+      VrfAccepts(op, I, chal, O, tdImage, true, vk) @ #n
+    ==> 
+        Ex #i.          
+        InitialInstall(tdImage) @ #i
+	& #i < #n"
+
+end

@@ -1,0 +1,185 @@
+theory PALM_Mem_Mapped_Public_IO
+begin
+
+builtins: hashing, signing, multiset, locations-report, natural-numbers
+
+functions: train/2, datasets/1
+
+/* ============================================================
+   KEY and TDX SETUP (Steps 1-3)
+   ============================================================ */
+
+rule Init_TDX_TD:
+  [ 
+      Fr(~k),   // This is the TDX internal mac key
+      Fr(~qsk), // this is the quoting enclave secret key
+      In(tdImage) // this is the tdImage received as input
+  ] 
+  --[
+      InitTD(tdImage),     /// log that we have initialized a td with the tdImage
+      SecretKey(~k),       /// log that we have two secret keys
+      SecretKey(~qsk),
+      InitialInstall(tdImage) // install software S into tdImage`
+  ]->
+  [
+      !Key(~k),    /// persistant facts about the three keys: k, (qsk, qpk)
+      !QESignKey(~qsk),
+      !QEVerKey(pk(~qsk)),
+      Out(pk(~qsk)), /// public key is known to adv, so output
+      !TDIsRunning(tdImage) /// fact that is used to "launch the td" in a sense, 
+                              /// in TDX, launch also means CPU extends hash
+  ]
+
+/* Step 4 */
+/// now get the op inputs [op, chaal, I]
+rule Get_Operation_Inputs:
+  [ In(op), In(chal), !TDIsRunning(hTD)] 
+  --[InputMessage(op, chal)]->
+  [ OperationInputs(op, chal, hTD)]
+
+/* setp 5 */
+//// execute to produce O, now using mem-mapped dataset for I
+rule Execute_Operation: // start operation
+  [OperationInputs(op, chal, hTD), Fr(~sid)]
+  --[ SessionStarted(~sid, op, chal, hTD)]->
+  [State(~sid, op, chal, hTD, train(op, 'empty'), 'empty', 'none', %1)]
+
+//// send output 'get' request to disk for a particular index
+rule SingleTraining_lock_and_lookup:
+  [State(sid, op, chal, hTD, pretrained, block_data_multiset, block_indices, %index)]
+  -->
+  [Out(<'get', sid, %index>), PendingLookup(sid, op, chal, hTD, pretrained, block_data_multiset, block_indices, %index)]
+
+//// model of storage as adv controlled
+rule DatasetStorage:
+  [ In(<'get', sid, index>) ]
+  -->
+  [ Out(<'batch', sid, datasets(index)> ) ]
+
+//// get batch as input, then return updated state with the incremental training batch. also update the data multiset
+rule SingleTraining_get_batch_and_train_then_insert_and_unlock:
+  let
+    model = train(op, batch)
+    new_block_data_multiset = history_block_data_multiset ++ <%index, batch>
+    new_block_indices = h(<batch, history_block_indices>)
+  in
+  [In(<'batch', sid, batch>), PendingLookup(sid, op, chal, hTD, pretrained, history_block_data_multiset, history_block_indices, %index)]
+  --[Trained(sid, op, chal, hTD,  model, new_block_data_multiset, new_block_indices)]->
+  [State(sid, op, chal, hTD, model, new_block_data_multiset, new_block_indices, %index %+ %1)]
+
+/* Step 6 and 7*/
+rule TD_Produce_Report:
+    let
+    O = train(op, I)
+    mac = h(<hI, h(op), h(chal), h(O), hTD, k>)
+    in
+    [ !Key(k), 
+    State(sid, op, chal, hTD, O, I, hI, index) // interpret the datamultiset as the input, model as output
+    ]
+  --[ TDProducesReport(op, I, hI, chal, O, hTD, k) ]->
+    [
+      Out(<O, hI, h(op), h(chal), h(O), hTD, mac>), 
+      ReportReady(op, I, hI, chal, O, hTD, k)
+    ]
+
+/* Step 9 */
+///// Should only produce quote if receives as input a report and MAC that was produced over the report with k
+rule QE_Produce_Quote:
+    let 
+      mac = h(<hI, hOp, hChal, hO, hTD, k>)
+      sig = sign(<hI, hOp, hChal, hO, hTD>, qsk)
+    in
+    [ 
+      !QESignKey(qsk),
+      In(<O, hI, hOp, hChal, hO, hTD, mac>),
+      ReportReady(op, I, hI, chal, O, hTD, k)
+    ]
+  --[
+      MacCheck(hI, hOp, hChal, hO, hTD, mac, k),
+      QEQuotes(hI, hOp, hChal, hO, hTD, pk(qsk))
+    ]->
+    [Out(<O, sig>), SignatureReady(op, I, hI, chal, O, hTD, sig)]
+
+/* Step 10 */
+rule Vrf_Verifies:
+    [ !QEVerKey(pkQ),
+      SignatureReady(op, I, hI, chal, O, hTD, sig),
+      In(<O, sig>)
+    ]
+  --[ VrfAccepts(op, I, hI, chal, O, hTD, verify(sig, <hI, h(op), h(chal), h(O), hTD>, pkQ), pkQ) ]->
+    [] 
+
+
+/* ============================================================
+   LEMMAS
+   ============================================================ */
+
+lemma prv_can_attest:
+  exists-trace
+  "Ex op I hI chal O hTD k vk #j #m #n.
+    TDProducesReport(op, I, hI, chal, O, hTD, k) @ #j
+    & QEQuotes(hI, h(op), h(chal), h(O), hTD, vk) @ #m
+    & VrfAccepts(op, I, hI, chal, O, hTD, true, vk) @ #n
+    & #j < #m & #m < #n"
+
+lemma FunctionalTraining: exists-trace
+    "Ex sid m hm hi op chal hTD #i. Trained(sid, op, chal, hTD, m, hm, hi) @ i"
+
+lemma FunctionalRepeatedTraining: exists-trace
+    "Ex sid m1 m2 hm1 hm2 hi1 hi2 op1 op2 chal1 chal2 hTD1 hTD2 #i #j. Trained(sid, op1, chal1, hTD1, m1, hm1, hi1) @ i & Trained(sid, op2, chal2, hTD2, m2, hm2, hi2) @ j & i < j"
+
+lemma MatchingHashchainsMeanMatchingMultiset [use_induction,reuse]: all-traces
+    "All sid1 sid2 m1 m2 hm1 hm2 hi op1 op2 chal1 chal2 hTD1 hTD2 #i #j.
+       Trained(sid1, op1, chal1, hTD1, m1, hm1, hi) @ i & Trained(sid2, op2, chal2, hTD2, m2, hm2, hi) @ j ==> hm1 = hm2"
+
+lemma key_secrecy [reuse]:
+  "All k #i. SecretKey(k) @ #i ==> not (Ex #j. K(k) @ #j)"
+
+lemma quote_integrity [reuse]:
+  "All op I hI chal O hTD vk #n.
+     VrfAccepts(op, I, hI, chal, O, hTD, true, vk) @ #n
+   ==> Ex #m. QEQuotes(hI, h(op), h(chal), h(O), hTD, vk) @ #m & #m < #n"
+
+lemma quote_only_if_mac:
+  "All hI hOp hChal hO hTD mac k #i.
+      MacCheck(hI, hOp, hChal, hO, hTD, mac, k) @ #i
+    ==> mac = h(<hI, hOp, hChal, hO, hTD, k>)"
+
+lemma O_came_from_op_and_I:
+  "All op I hI chal O hTD pkQ #i.
+     VrfAccepts(op, I, hI, chal, O, hTD, true, pkQ) @ #i
+     ==> O = train(op, I)"
+
+lemma td_measurement_integrity:
+  "All op I hI chal O tdImage vk #n.
+      VrfAccepts(op, I, hI, chal, O, tdImage, true, vk) @ #n
+    ==> 
+        Ex #i.          
+        InitialInstall(tdImage) @ #i
+        & #i < #n"
+
+////////////////////////////////////////////////////////////////////////
+// WARNING WARNING WARNING: Assumption, needs to be proved separately (see paper) //
+////////////////////////////////////////////////////////////////////////
+
+restriction MultisetEqualityImpliesHashchainEquality:
+    "All sid1 sid2 op1 op2 chal1 chal2 hTD1 hTD2 m1 m2 hm hi1 hi2 #i #j. 
+    Trained(sid1, op1, chal1, hTD1, m1, hm, hi1) @ i 
+    & Trained(sid2, op2, chal2, hTD2, m2, hm, hi2) @ j
+        ==> hi1 = hi2"
+
+//////////////////////////////////////////////////////////////////////////////
+
+lemma MatchingHashchainsMeanMatchingModel [use_induction,reuse]: all-traces
+  "All sid1 sid2 op chal1 chal2 hTD1 hTD2 m1 m2 hm1 hm2 hi #i #j. 
+    Trained(sid1, op, chal1, hTD1, m1, hm1, hi) @ i 
+    & Trained(sid2, op, chal2, hTD2, m2, hm2, hi) @ j 
+    ==> m1 = m2"
+
+lemma MatchingMultisetsMeanMatchingModel [reuse]: all-traces
+    "All sid1 sid2 op chal1 chal2 hTD1 hTD2 m1 m2 hm hi1 hi2 #i #j. 
+     Trained(sid1, op, chal1, hTD1, m1, hm, hi1) @ i 
+     & Trained(sid2, op, chal2, hTD2, m2, hm, hi2) @ j 
+     ==> m1 = m2"
+
+end
