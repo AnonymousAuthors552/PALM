@@ -38,7 +38,7 @@ class MeasureDataset(Dataset):
         self.getitem_measure_time = 0
         self.measure = measure
         self.access_trace = []
-        self.running_access_hash = MSetMuHash()
+        self.running_access_hash = MSetMuHash() # MSetMuHash() or ECMH() 
 
     @property
     def _info(self):
@@ -56,8 +56,6 @@ class MeasureDataset(Dataset):
     
     def __getitem__(self, idx):
         self.total_accesses += 1
-        # print("__getitem__ here!")
-        # print(self.total_accesses)
         record_load_time_start = time.time()
         item = self.dataset[idx]
         record_load_time_end = time.time()
@@ -67,11 +65,10 @@ class MeasureDataset(Dataset):
             if self.measure:
                 # self.access_trace.append(idx)
                 record_measure_time_start = time.time()
-                self.running_access_hash.add(json.dumps(item))
+                self.running_access_hash.add(json.dumps(item) + str(idx)) #  
                 record_measure_time_end = time.time()
                 self.getitem_measure_time += (record_measure_time_end - record_measure_time_start)
-                # print(self.running_access_hash.digest())
-        # print(self.total_accesses)
+
         return item
 
     def set_measure(self, measure):

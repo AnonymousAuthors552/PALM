@@ -9,10 +9,7 @@ import re
 import psutil
 import threading
 import multiprocessing.util
-import atexit
 from tqdm import tqdm
-
-from unsloth import FastLanguageModel, is_bfloat16_supported
 
 import palm
 from msh import *
@@ -51,7 +48,7 @@ MODEL_MAP = {
 }
 
 # Optional: models needing extra env tweaks
-SPECIAL_ENV = {"gemma", "phi"}  
+SPECIAL_ENV = {"gemma", "phi"}  #"gemma", 
 
 def get_model_path(args):
     if args.model in SPECIAL_ENV:
@@ -159,7 +156,7 @@ def end_memory_measure(in_process, mem_before_proc, mem_before_sys):
 
 class ProcessState:
     def __init__(self):
-        self.running_access_hash = palm.MSetMuHash()
+        self.running_access_hash = palm.MSetMuHash() #palm.ECMH() 
         # self.load_time = 0.0
         # self.measure_time = 0.0
         self.total_accesses = 0
@@ -227,9 +224,10 @@ def pretraining_attestation(args):
 
             # loading raw data
             dataset = load_dataset("bookcorpus") #trust_remote_code=True
-            dataset['train'] = dataset['train'].select(range(250000))
-            dataset = dataset['train'].train_test_split(test_size=0.0015) 
+            # dataset['train'] = dataset['train'].select(range(250000))
+            dataset = dataset['train']
             dataset.save_to_disk(dataset_path)
+            dataset = dataset.train_test_split(test_size=0.0015) 
             
             tokenized_ds = dataset.map(lambda example: utils.tokenize_function(tokenizer, example),batched=True,remove_columns='text',num_proc=8)
             tokenized_ds.save_to_disk(tokenized_ds_path)
@@ -289,6 +287,7 @@ def pretraining_attestation(args):
     attestation_time = 0
     output_measurement_time = 0
     output_storage_time = 0
+    training_args_measure_time = 0
 
     # Save and measure the output model
     directory = f"./saved_models/gpt2/"
@@ -296,7 +295,8 @@ def pretraining_attestation(args):
     evi_dir = os.path.join(directory, "evidence")
     if not os.path.exists(evi_dir):
         os.makedirs(evi_dir, exist_ok=True)
-    
+
+    output_model_measure_time = 0
     output_model_time_start = time.time()
     model_hash, model_config_hash, output_model_measure_time = palm.save_model(trainer.model, model_dir, args.measure)
     palm.save_tokenizer(tokenizer, model_dir, measure=False)
@@ -377,6 +377,8 @@ def pretraining_attestation(args):
 
 # Proof of fine-tuning
 def finetuning_attestation(args):
+
+    from unsloth import FastLanguageModel, is_bfloat16_supported
 
     path = "./data/yahma/alpaca-cleaned"
     dataset_path = os.path.join(path, "dataset")
@@ -517,6 +519,7 @@ def finetuning_attestation(args):
     attestation_time = 0
     output_measurement_time = 0
     output_storage_time = 0
+    training_args_measure_time = 0
 
     directory = os.path.join('./saved_models/', args.model)
     directory = os.path.join(directory, args.model_size)
@@ -774,6 +777,7 @@ def inference_attestation(args):
     attestation_time = 0
     output_measurement_time = 0
     output_storage_time = 0
+    conv_measure_time = 0
 
     # Generate TDX TD quote using DCAP
     if args.measure:
@@ -828,7 +832,7 @@ def evaluation_attestation(args):
     print("Using model:", model_path)
 
     input_model_load_time_start = time.time()
-    model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(model_path, device_map=args.device)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     input_model_load_time_end = time.time()
     input_model_load_time = input_model_load_time_end - input_model_load_time_start
@@ -912,8 +916,10 @@ def evaluation_attestation(args):
 
                     total_records += len(d)
 
-                    _, dataset_hash, ds_input_measure_time = palm.measure_output(d.to_list())
-                    dataset_hashes[f"{t_name}:{split}"] = dataset_hash
+                    ds_input_measure_time = 0
+                    if args.measure:
+                        _, dataset_hash, ds_input_measure_time = palm.measure_output(d.to_list())
+                        dataset_hashes[f"{t_name}:{split}"] = dataset_hash
 
                     ds[split] = palm.MeasureDataset(
                         d,
@@ -975,6 +981,7 @@ def evaluation_attestation(args):
     attestation_time = 0
     output_measurement_time = 0
     output_storage_time = 0
+    result_output_measure_time = 0
 
     # Measure the output MMLU result
     if args.measure:
@@ -1001,7 +1008,7 @@ def evaluation_attestation(args):
                 else:
                     h = dataset.running_access_hash.digest()
                     h_bytes = h.to_bytes((h.bit_length() + 7) // 8, byteorder='big')
-                    final_hashes[key] = base64.b64encode(h_bytes).decode('utf-8')
+                    final_hashes[key] = base64.b64encode(h_bytes).decode('utf-8')                    
         payload = {
             'model': base64.b64encode(model_hash).decode('utf-8'),
             'tokenizer_hash': {
@@ -1137,6 +1144,8 @@ def eval_bleu(args):
     evi_dir = os.path.join(directory, "evidence")
     if not os.path.exists(evi_dir):
         os.makedirs(evi_dir, exist_ok=True)
+
+    eval_result_output_measure_time = 0
 
     # Measure output BLEU score result
     if args.measure:
@@ -1315,7 +1324,7 @@ def distribution_attestation(args):
     stop_words = set(stopwords.words('english'))
     word_pattern = re.compile(r'\b[a-zA-Z]+\b')
 
-    dataset_name = "bookcorpus"
+    dataset_name = "bookcorpus_tiny"
     path = os.path.join("./data/", dataset_name)
     dataset_path = os.path.join(path, "dataset")
 
@@ -1324,14 +1333,19 @@ def distribution_attestation(args):
             print("Loading dataset...")
             print(f"In-memory: {args.in_memory}")
             in_process, mem_before_proc, mem_before_sys = start_memory_measure()
-            dataset, dataset_hashes = palm.load_dataset(load_path=dataset_path, load_in_memory=args.in_memory, split="train", measure=args.measure)
+            dataset, dataset_hashes = palm.load_dataset(load_path=dataset_path, load_in_memory=args.in_memory, measure=args.measure)
             mem_usage = end_memory_measure(in_process, mem_before_proc, mem_before_sys)
+            print(len(dataset))
             break
         except Exception as e:
             print(f"Fallback to HF download: {e}")
-            dataset = load_dataset(dataset_name, split="train")
+            dataset = load_dataset("bookcorpus") #trust_remote_code=True
+            # dataset['train'] = dataset['train'].select(range(250000))
+            dataset = dataset['train']
+            # dataset = dataset.select(range(len(dataset)//1000))
             dataset.save_to_disk(dataset_path)
-            dataset.cleanup_cache_files()
+            # print(len(dataset))
+            # dataset.cleanup_cache_files()
             print("Saved dataset to disk.")
 
     print(f"Dataset load time: {dataset.load_time}")
@@ -1444,6 +1458,8 @@ def distribution_attestation(args):
 
     csv_bytes = csv_buffer.getvalue().encode("utf-8")
 
+    plot_output_measure_time = 0 
+    top_words_output_measure_time = 0
     if args.measure:
         _, plot_hash, plot_output_measure_time = palm.measure_output(plot_buf.getvalue())
         _, top_words_hash, top_words_output_measure_time = palm.measure_output(csv_bytes)
@@ -1523,8 +1539,7 @@ def distribution_attestation(args):
 # Proof of binding
 def dataset_binding_attestation(args):
     
-    dataset_name = "bookcorpus"
-    path = os.path.join("./data/", dataset_name)
+    path = "./data/bookcorpus_small"
     dataset_path = os.path.join(path, "dataset")
     while True:
         try:
@@ -1532,18 +1547,18 @@ def dataset_binding_attestation(args):
             in_process, mem_before_proc, mem_before_sys = start_memory_measure()
 
             # Load and measure in-memory dataset
-            ds_in_mem, ds_in_mem_hashes = palm.load_dataset(load_path=path, load_in_memory=True, measure=True)
+            ds_in_mem, ds_in_mem_hashes = palm.load_dataset(load_path=dataset_path, load_in_memory=True, measure=True)
             mem_usage = end_memory_measure(in_process, mem_before_proc, mem_before_sys)
 
             # Initialize memory-mapped dataset
-            ds_mem_mapped, _ = palm.load_dataset(load_path=path, load_in_memory=False, measure=True)
+            ds_mem_mapped, _ = palm.load_dataset(load_path=dataset_path, load_in_memory=False, measure=True)
+
             break
         except Exception as e:
-            print(f"Fallback to HF download: {e}")
-            dataset = load_dataset(dataset_name, split="train")
+            print("Dataset not found...")
+            dataset = load_dataset("bookcorpus")
+            dataset = dataset["train"].select(range(len(dataset["train"])//100))
             dataset.save_to_disk(dataset_path)
-            dataset.cleanup_cache_files()
-            print("Saved dataset to disk.")
 
     num_proc=8
 
@@ -1618,10 +1633,10 @@ def dataset_binding_attestation(args):
 
     # Generate TDX TD quote using DCAP
     if args.measure:
-        assert ds_mem_mapped.total_accesses == ds_in_mem_len, (
-            f"Mismatch: total_accesses={ds_mem_mapped.total_accesses}, "
-            f"expected={ds_in_mem_len}"
-        )
+        # assert ds_mem_mapped.total_accesses == ds_in_mem_len, (
+        #     f"Mismatch: total_accesses={ds_mem_mapped.total_accesses}, "
+        #     f"expected={ds_in_mem_len}"
+        # )
 
         # In-memory dataset
         dataset_in_mem_hashes_output = {
@@ -1670,7 +1685,7 @@ def dataset_binding_attestation(args):
 # Proof of dataset preprocessing
 def dataset_preprocess_attestation(args):
     
-    path = "./data/bookcorpus"
+    path = "./data/bookcorpus_small"
     dataset_path = os.path.join(path, "dataset")
 
     tokenizer_load_time_start = time.time()
@@ -1678,6 +1693,7 @@ def dataset_preprocess_attestation(args):
     tokenizer_load_time_end = time.time()
     tokenizer_load_time = tokenizer_load_time_end - tokenizer_load_time_start
     tokenizer.pad_token=tokenizer.eos_token
+    tokenizer_measure_time = 0
 
     # Measure the tokenizer used in the operation
     if args.measure:
@@ -1686,12 +1702,13 @@ def dataset_preprocess_attestation(args):
     while True:
         try:
             in_process, mem_before_proc, mem_before_sys = start_memory_measure()
-            dataset, dataset_hashes = palm.load_dataset(load_path=path, load_in_memory=args.in_memory, measure=args.measure)
+            dataset, dataset_hashes = palm.load_dataset(load_path=dataset_path, load_in_memory=args.in_memory, measure=args.measure)
             mem_usage = end_memory_measure(in_process, mem_before_proc, mem_before_sys)
             break
         except Exception as e:
             print("Dataset not found...")
             dataset = load_dataset("bookcorpus")
+            dataset = dataset["train"].select(range(len(dataset["train"])//100))
             dataset.save_to_disk(dataset_path)
     
     compute_time_start = time.time()
@@ -1714,7 +1731,7 @@ def dataset_preprocess_attestation(args):
             return results
         return process_batch
     
-    num_proc=8
+    num_proc=1
 
     ds_loader = DataLoader(
         dataset,

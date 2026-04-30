@@ -2,17 +2,17 @@
 set -euo pipefail
 
 # ---------------- CONFIG ----------------
-attestation_with_model=("finetune" "eval" "eval_bleu" "inference")
-attestation_no_model=("pretrain" "distribution" "preprocess" "bind")
+attestation_with_model=("eval_bleu") #"finetune" "eval" "eval_bleu" "inference"
+attestation_no_model=("pretrain") #"pretrain" "distribution" "bind" "preprocess"
 
-models=("llama" "gemma" "phi")
+models=("llama" "gemma" "phi") # "llama" "gemma" "phi"
 model_size="L"
 
 measure="--measure"   # leave empty "" if not using laminator measurement
 device="cuda"
 num_runs=5
 
-python_exec="../.venv/bin/python3"
+python_exec="./.testenv/bin/python3"
 script="main_LLM.py"
 # ----------------------------------------
 
