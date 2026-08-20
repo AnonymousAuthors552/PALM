@@ -11,6 +11,8 @@ import threading
 import multiprocessing.util
 from tqdm import tqdm
 
+
+
 import palm
 from msh import *
 import utils
@@ -224,7 +226,7 @@ def pretraining_attestation(args):
 
             # loading raw data
             dataset = load_dataset("bookcorpus") #trust_remote_code=True
-            # dataset['train'] = dataset['train'].select(range(250000))
+            dataset['train'] = dataset['train'].select(range(25000))
             dataset = dataset['train']
             dataset.save_to_disk(dataset_path)
             dataset = dataset.train_test_split(test_size=0.0015) 
@@ -327,6 +329,13 @@ def pretraining_attestation(args):
             }
         else:
             h_train = train_dataset.running_access_hash.digest() 
+            print("-------------Hashx1-------------------")
+            print(h_train)
+            train_dataset.running_access_hash.multiply(h_train)
+            h_train2 = train_dataset.running_access_hash.digest()
+            print("-------------Hashx2-------------------")
+            print(h_train2)
+            print("--------------------------------------")
             h_test = train_dataset.running_access_hash.digest() 
             h_train_bytes = h_train.to_bytes((h_train.bit_length() + 7) // 8, byteorder='big')
             h_test_bytes = h_test.to_bytes((h_test.bit_length() + 7) // 8, byteorder='big')
@@ -494,6 +503,7 @@ def finetuning_attestation(args):
         "report_to": "none",
         "remove_unused_columns": False,
     }
+
     training_args = TrainingArguments(**training_args_dict)
 
     compute_start = time.time()
@@ -557,7 +567,7 @@ def finetuning_attestation(args):
                 for split in formatted_ds_hashes
             }
         else:
-            h = dataset.running_access_hash.digest() 
+            h = dataset.running_access_hash.digest()
             h_bytes = h.to_bytes((h.bit_length() + 7) // 8, byteorder='big')
             formatted_ds = {
                 'train': base64.b64encode(h_bytes).decode('utf-8')
@@ -1324,7 +1334,7 @@ def distribution_attestation(args):
     stop_words = set(stopwords.words('english'))
     word_pattern = re.compile(r'\b[a-zA-Z]+\b')
 
-    dataset_name = "bookcorpus_tiny"
+    dataset_name = "wikipedia"
     path = os.path.join("./data/", dataset_name)
     dataset_path = os.path.join(path, "dataset")
 
@@ -1539,7 +1549,7 @@ def distribution_attestation(args):
 # Proof of binding
 def dataset_binding_attestation(args):
     
-    path = "./data/bookcorpus_small"
+    path = "./data/wikipedia_small"
     dataset_path = os.path.join(path, "dataset")
     while True:
         try:
@@ -1556,8 +1566,13 @@ def dataset_binding_attestation(args):
             break
         except Exception as e:
             print("Dataset not found...")
-            dataset = load_dataset("bookcorpus")
-            dataset = dataset["train"].select(range(len(dataset["train"])//100))
+            dataset = load_dataset("wikimedia/wikipedia", WIKI_SNAPSHOT)
+            dataset = dataset["train"]
+            # Keep only "text" to match the bookcorpus single-column pipeline.
+            extra_cols = [c for c in dataset.column_names if c != "text"]
+            if extra_cols:
+                dataset = dataset.remove_columns(extra_cols)
+            dataset = dataset.select(range(len(dataset)//100))
             dataset.save_to_disk(dataset_path)
 
     num_proc=8
@@ -1731,7 +1746,7 @@ def dataset_preprocess_attestation(args):
             return results
         return process_batch
     
-    num_proc=1
+    num_proc=8
 
     ds_loader = DataLoader(
         dataset,
@@ -1770,10 +1785,9 @@ def dataset_preprocess_attestation(args):
                 dataset.running_access_hash.multiply(s["running_access_hash"])
         print("Updated hash:", dataset.running_access_hash.digest())
 
-    tokenized_ds = Dataset.from_list(tokenized_records)
-    concated_ds = tokenized_ds.map(utils.concat,batched=True,batch_size=1000000,num_proc=8)
-
-    chunked_ds = concated_ds.map(utils.chunk,batched=True,batch_size=2,num_proc=8)
+    chunked_ds = Dataset.from_list(tokenized_records)
+    # concated_ds = tokenized_ds.map(utils.concat,batched=True,batch_size=1000000,num_proc=8)
+    # chunked_ds = concated_ds.map(utils.chunk,batched=True,batch_size=2,num_proc=8)
     compute_time_end = time.time()
 
     compute_time = compute_time_end - compute_time_start
@@ -1855,6 +1869,392 @@ def dataset_preprocess_attestation(args):
     return exp_config
 
 
+WIKI_SNAPSHOT = "20231101.en"
+
+def distribution_attestation_wiki(args):
+    from collections import Counter
+    import nltk
+    import matplotlib.ticker as mticker
+    nltk.download('stopwords')
+    from nltk.corpus import stopwords
+ 
+    stop_words = set(stopwords.words('english'))
+    word_pattern = re.compile(r'\b[a-zA-Z]+\b')
+ 
+    dataset_name = "wikipedia"
+    path = os.path.join("./data/", dataset_name)
+    dataset_path = os.path.join(path, "dataset")
+ 
+    while True:
+        try:
+            print("Loading dataset...")
+            print(f"In-memory: {args.in_memory}")
+            in_process, mem_before_proc, mem_before_sys = start_memory_measure()
+            dataset, dataset_hashes = palm.load_dataset(load_path=dataset_path, load_in_memory=args.in_memory, measure=args.measure)
+            mem_usage = end_memory_measure(in_process, mem_before_proc, mem_before_sys)
+            print(len(dataset))
+            break
+        except Exception as e:
+            print(f"Fallback to HF download: {e}")
+            dataset = load_dataset("wikimedia/wikipedia", WIKI_SNAPSHOT)
+            dataset = dataset['train']
+            # Wikipedia carries id/url/title/text; keep only text
+            extra_cols = [c for c in dataset.column_names if c != "text"]
+            if extra_cols:
+                dataset = dataset.remove_columns(extra_cols)
+            dataset.save_to_disk(dataset_path)
+            print("Saved dataset to disk.")
+ 
+    print(f"Dataset load time: {dataset.load_time}")
+    print(f"Dataset measure time: {dataset.measure_time}")
+    print(f"Total accesses: {dataset.total_accesses}")
+    print(f"Access Trace: {dataset.access_trace}")
+    print(f"Running Hash: {dataset.running_access_hash}")
+    print("------------------------------------------------------------------")
+ 
+    compute_time_start = time.time()
+ 
+    num_proc=8
+ 
+    # Process using PyTorch's DataLoader
+    def torch_wrapper_extract_words(dataset):
+        def test_extract_words(batch):
+            state = get_state()
+            results = []
+            for sample in batch:
+                text = sample.get("text", "")
+                words = word_pattern.findall(text.lower())
+                filtered = [w for w in words if w not in stop_words and len(w) > 1]
+ 
+                state.total_accesses = dataset.total_accesses
+                state.getitem_load_time = dataset.getitem_load_time
+                state.getitem_measure_time = dataset.getitem_measure_time
+                state.running_access_hash = dataset.running_access_hash
+                results.append({"filtered_words": filtered, "__state__": state.to_dict()})
+            return results
+        return test_extract_words
+    
+
+    ds_loader = DataLoader(dataset, collate_fn=torch_wrapper_extract_words(dataset), batch_size=1, shuffle=False, num_workers=num_proc)
+    ds_loader_len = len(ds_loader)
+ 
+    # Group states by process ID
+    final_state = {}
+    all_words = Counter()
+    for batch in tqdm(ds_loader, total=ds_loader_len, desc=f"Mapping dataset (num_proc={num_proc})"):
+        for record in batch:
+            all_words.update(record["filtered_words"])
+            stat = record.get("__state__")
+            if stat is not None:
+                pid = stat["pid"]
+                if pid not in final_state or stat["total_accesses"] > final_state[pid]["total_accesses"]:
+                    final_state[pid] = stat
+ 
+    print("Mapped")
+    print("All PIDs in final_state:", list(final_state.keys()))
+ 
+    # Word frequency
+    most_common = all_words.most_common(10000)
+ 
+    # Word length frequency
+    length_counter = Counter(len(word) for word in all_words)
+    lengths = sorted(length_counter.keys())
+    frequencies = [length_counter[l] for l in lengths]
+ 
+    compute_time_end = time.time()
+    compute_time = compute_time_end - compute_time_start
+ 
+    dataset.total_accesses = sum(s["total_accesses"] for s in final_state.values())
+    dataset.getitem_load_time = sum(s["getitem_load_time"] for s in final_state.values()) / num_proc
+    dataset.getitem_measure_time = sum(s["getitem_measure_time"] for s in final_state.values()) / num_proc
+ 
+    if args.measure:
+        values = list(final_state.values())
+        dataset.running_access_hash.reset(value=int(values[0]["running_access_hash"]))
+        if num_proc > 1:
+            for s in values[1:]:
+                dataset.running_access_hash.multiply(s["running_access_hash"])
+        print(dataset.running_access_hash.digest())
+ 
+    print(f"Compute time: {compute_time}")
+    print("------------------------------------------------------------------")
+ 
+    # Plot word length distribution
+    plt.figure(figsize=(10, 6))
+    plt.bar(lengths, frequencies, color='skyblue')
+    plt.xlabel('Word Length')
+    plt.ylabel('Frequency')
+    plt.title(f'Word Length Distribution in {dataset_name}')
+    plt.grid(axis='y')
+    plt.xticks(lengths)
+    plt.gca().xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+    plt.tight_layout()
+    plot_buf = io.BytesIO()
+    plt.savefig(plot_buf, format='png', dpi=300)
+    plot_buf.seek(0)
+ 
+    # Save all of the distribution results
+    csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer)
+    writer.writerow(["Rank", "Word", "Frequency"])
+    for i, (word, freq) in enumerate(most_common, 1):
+        writer.writerow([i, word, freq])
+ 
+    csv_bytes = csv_buffer.getvalue().encode("utf-8")
+ 
+    plot_output_measure_time = 0
+    top_words_output_measure_time = 0
+    if args.measure:
+        _, plot_hash, plot_output_measure_time = palm.measure_output(plot_buf.getvalue())
+        _, top_words_hash, top_words_output_measure_time = palm.measure_output(csv_bytes)
+ 
+    directory = f"./llm_output/{args.attestation_type}"
+    directory = os.path.join(directory, f"in-memory-{args.in_memory}")
+    evi_dir = os.path.join(directory, "evidence")
+    if not os.path.exists(evi_dir):
+        os.makedirs(evi_dir, exist_ok=True)
+ 
+    plot_output_storage_time_start = time.time()
+    with open(f"{directory}/word_length_distribution.png", "wb") as f:
+        f.write(plot_buf.getvalue())
+    plot_output_storage_time_end = time.time()
+    plot_output_storage_time = plot_output_storage_time_end - plot_output_storage_time_start
+    print("Saved word length distribution plot to word_length_distribution.png")
+ 
+    top_words_output_storage_time_start = time.time()
+    with open(f"{directory}/top_words.csv", "w", newline='') as f:
+        f.write(csv_buffer.getvalue())
+    top_words_output_storage_time_end = time.time()
+    top_words_output_storage_time = top_words_output_storage_time_end - top_words_output_storage_time_start
+    print("Saved top 10k words to top_words.csv")
+ 
+    attestation_time = 0
+    output_measurement_time = 0
+    output_storage_time = 0
+    model_path="NA"
+ 
+    if args.measure:
+        if dataset.in_memory:
+            dataset_hashes_output = {
+                split: {
+                    fname: base64.b64encode(bytes.fromhex(h)).decode('utf-8')
+                    for fname, h in dataset_hashes[split].items()
+                }
+                for split in dataset_hashes
+            }
+        else:
+            h = dataset.running_access_hash.digest()
+            h_bytes = h.to_bytes((h.bit_length() + 7) // 8, byteorder='big')
+            dataset_hashes_output = {
+                'train': base64.b64encode(h_bytes).decode('utf-8')
+            }
+        payload = {
+            'dataset_hash': dataset_hashes_output,
+            'top_words_hash': base64.b64encode(top_words_hash).decode('utf-8'),
+            'word_length_distribution_plot': base64.b64encode(plot_hash).decode('utf-8'),
+        }
+        with open(f'{evi_dir}/payload_distribution.json', 'w') as f:
+            json.dump(payload, f)
+        output_measurement_time, attestation_time, output_storage_time = palm.attest(payload, f"{evi_dir}/attestation_{args.attestation_type}.json")
+ 
+    exp_config = init_exp_config(args,
+                    model_path=model_path,
+                    mem_usage=mem_usage,
+                    total_access=dataset.total_accesses,
+                    compute_time=compute_time,
+                    input_dataset_load_time=dataset.load_time,
+                    input_dataset_measure_time=dataset.measure_time,
+                    getitem_load_time=dataset.getitem_load_time,
+                    getitem_measure_time=dataset.getitem_measure_time,
+                    input_model_load_time=0,
+                    input_model_measure_time=0,
+                    attestation_time=attestation_time,
+                    output_dataset_storage_time=0,
+                    output_dataset_measurement_time=0,
+                    output_model_storage_time=0,
+                    output_model_measurement_time=0,
+                    output_storage_time=(output_storage_time + top_words_output_storage_time + plot_output_storage_time),
+                    output_measurement_time=(output_measurement_time + top_words_output_measure_time + plot_output_measure_time),
+                    )
+ 
+    return exp_config
+ 
+ 
+def dataset_preprocess_attestation_wiki(args):
+ 
+    path = "./data/wikipedia_small"
+    dataset_path = os.path.join(path, "dataset")
+ 
+    tokenizer_load_time_start = time.time()
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer_load_time_end = time.time()
+    tokenizer_load_time = tokenizer_load_time_end - tokenizer_load_time_start
+    tokenizer.pad_token=tokenizer.eos_token
+    tokenizer_measure_time = 0
+ 
+    # Measure the tokenizer used in the operation
+    if args.measure:
+        tokenizer_measurement, tokenizer_measure_time = palm.save_tokenizer(tokenizer, "./", save_to_disk=False, measure=args.measure)
+ 
+    while True:
+        try:
+            in_process, mem_before_proc, mem_before_sys = start_memory_measure()
+            dataset, dataset_hashes = palm.load_dataset(load_path=dataset_path, load_in_memory=args.in_memory, measure=args.measure)
+            mem_usage = end_memory_measure(in_process, mem_before_proc, mem_before_sys)
+            break
+        except Exception as e:
+            print("Dataset not found...")
+            dataset = load_dataset("wikimedia/wikipedia", WIKI_SNAPSHOT)
+            dataset = dataset["train"]
+            # Keep only "text"
+            extra_cols = [c for c in dataset.column_names if c != "text"]
+            if extra_cols:
+                dataset = dataset.remove_columns(extra_cols)
+            dataset = dataset.select(range(len(dataset)//100))
+            dataset.save_to_disk(dataset_path)
+
+ 
+    def torch_wrapper_tokenize(dataset, tokenizer):
+        def process_batch(batch):
+            state = get_state()
+            results = []
+            for sample in batch:
+                text = sample.get("text", "")
+                tokenized = tokenizer(text=text)
+ 
+                state.total_accesses = dataset.total_accesses
+                state.getitem_load_time = dataset.getitem_load_time
+                state.getitem_measure_time = dataset.getitem_measure_time
+                state.running_access_hash = dataset.running_access_hash
+ 
+                results.append({"tokenized": tokenized, "__state__": state.to_dict()})
+            return results
+        return process_batch
+ 
+    num_proc=8
+ 
+    ds_loader = DataLoader(
+        dataset,
+        collate_fn=torch_wrapper_tokenize(dataset, tokenizer),
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_proc,
+    )
+    ds_loader_len = len(ds_loader)
+
+    compute_time_start = time.time()
+ 
+    final_state = {}
+    tokenized_records = []
+ 
+    for batch in tqdm(ds_loader, total=ds_loader_len, desc=f"Tokenizing dataset (num_proc={num_proc})"):
+        for record in batch:
+            tokenized_records.append(record["tokenized"])
+            stat = record.get("__state__")
+            if stat is not None:
+                pid = stat["pid"]
+                if pid not in final_state or stat["total_accesses"] > final_state[pid]["total_accesses"]:
+                    final_state[pid] = stat
+ 
+    print("Tokenization complete.")
+    print("All PIDs in final_state:", list(final_state.keys()))
+ 
+    dataset.total_accesses = sum(s["total_accesses"] for s in final_state.values())
+    dataset.getitem_load_time = sum(s["getitem_load_time"] for s in final_state.values()) / num_proc
+    dataset.getitem_measure_time = sum(s["getitem_measure_time"] for s in final_state.values()) / num_proc
+    print(dataset.getitem_measure_time)
+ 
+    if hasattr(dataset, "running_access_hash"):
+        values = list(final_state.values())
+        dataset.running_access_hash.reset(value=int(values[0]["running_access_hash"]))
+        if num_proc > 1:
+            for s in values[1:]:
+                dataset.running_access_hash.multiply(s["running_access_hash"])
+        print("Updated hash:", dataset.running_access_hash.digest())
+ 
+    chunked_ds = Dataset.from_list(tokenized_records)
+    # concated_ds = tokenized_ds.map(utils.concat,batched=True,batch_size=1000000,num_proc=8)
+    # chunked_ds = concated_ds.map(utils.chunk,batched=True,batch_size=2,num_proc=8)
+
+    compute_time_end = time.time()
+    compute_time = compute_time_end - compute_time_start
+    print("Compute time:", compute_time)
+ 
+    directory = f"./llm_output/{args.attestation_type}"
+    directory = os.path.join(directory, f"in-memory-{args.in_memory}")
+    evi_dir = os.path.join(directory, "evidence")
+    if not os.path.exists(evi_dir):
+        os.makedirs(evi_dir, exist_ok=True)
+ 
+    # Save and measure preprocessed dataset
+    output_dataset_storage_time_start = time.time()
+    results, output_dataset_measure_time = palm.save_dataset(chunked_ds, directory)
+    output_dataset_storage_time_end = time.time()
+    output_dataset_storage_time = (output_dataset_storage_time_end - output_dataset_storage_time_start) - output_dataset_measure_time
+ 
+    attestation_time = 0
+    output_measurement_time = 0
+    output_storage_time = 0
+    model_path="NA"
+ 
+    if args.measure:
+        print("--------------------------------------------")
+        if dataset.in_memory:
+            dataset_hashes_output = {
+                split: {
+                    fname: base64.b64encode(bytes.fromhex(h)).decode('utf-8')
+                    for fname, h in dataset_hashes[split].items()
+                }
+                for split in dataset_hashes
+            }
+        else:
+            h_train = dataset.running_access_hash.digest()
+            h_train_bytes = h_train.to_bytes((h_train.bit_length() + 7) // 8, byteorder='big')
+            dataset_hashes_output = {
+                'train': base64.b64encode(h_train_bytes).decode('utf-8'),
+            }
+        payload = {
+            'tokenizer_hash': {
+                fname: base64.b64encode(h).decode('utf-8')
+                for fname, (_, h, _) in tokenizer_measurement.items()
+            },
+            'dataset_hash': {
+                "hf_ds": {
+                    split: {
+                        os.path.basename(shard["file"]): base64.b64encode(shard["hash"]).decode("utf-8")
+                        for shard in shard_list if shard["hash"] is not None
+                    }
+                    for split, shard_list in results.items()
+                },
+                'original_dataset_hashes': dataset_hashes_output
+            },
+        }
+        with open(f'{evi_dir}/payload_pretrain.json', 'w') as f:
+            json.dump(payload, f)
+        output_measurement_time, attestation_time, output_storage_time = palm.attest(payload, f"{evi_dir}/attestation_{args.attestation_type}.json")
+ 
+    exp_config = init_exp_config(args,
+                    model_path=model_path,
+                    mem_usage=mem_usage,
+                    total_access=(dataset.total_accesses),
+                    compute_time=compute_time,
+                    input_dataset_load_time=dataset.load_time,
+                    input_dataset_measure_time=dataset.measure_time,
+                    getitem_load_time=dataset.getitem_load_time,
+                    getitem_measure_time=dataset.getitem_measure_time,
+                    input_model_load_time=tokenizer_load_time,
+                    input_model_measure_time=tokenizer_measure_time,
+                    attestation_time=attestation_time,
+                    output_dataset_storage_time=output_dataset_storage_time,
+                    output_dataset_measurement_time=output_dataset_measure_time,
+                    output_model_storage_time=0,
+                    output_model_measurement_time=0,
+                    output_storage_time=(output_storage_time),
+                    output_measurement_time=(output_measurement_time),
+                    )
+ 
+    return exp_config
+
 def handle_args():
     parser = argparse.ArgumentParser()
 
@@ -1895,6 +2295,10 @@ if __name__ == "__main__":
         exp_config = dataset_binding_attestation(args)
     elif args.attestation_type == "preprocess":
         exp_config = dataset_preprocess_attestation(args)
+    elif args.attestation_type == "distribution_wiki":
+        exp_config = distribution_attestation_wiki(args)
+    elif args.attestation_type == "preprocess_wiki":
+        exp_config = dataset_preprocess_attestation_wiki(args)
     else:
         print("Incorrect attestation type")
         exit()
